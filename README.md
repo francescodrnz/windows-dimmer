@@ -28,18 +28,12 @@ pip install -r requirements.txt
 
 ## Utilizzo
 
-Avvia il programma con:
-
-``` bash
-pythonw dimmer.py
-```
-
-*(L'uso di `pythonw` esegue lo script in background senza finestre di terminale).*
+Avvia il programma da *dimmer.pyw*.
 
 Troverai un'icona a forma di luna 🌙 nella **System Tray** (in basso a destra, vicino all'orologio).
 
 ### Controlli
-Cliccando l'icona nella tray si apre il pannello di controllo temporaneo.
+Cliccando l'icona nella tray si apre il pannello di controllo temporaneo. Clicca ovunque fuori dal pannello per chiuderlo.
 
 | Elemento | Funzione |
 |---|---|
