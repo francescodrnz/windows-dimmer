@@ -1,6 +1,5 @@
 """
 NightDimmer – overlay click-through per ridurre la luminosità e il colore del monitor.
-VERSIONE: No-Widget (Funzionalità Pin rimossa)
 
 Dipendenze:
     pip install -r requirements.txt
@@ -50,12 +49,40 @@ WS_EX_LAYERED      = 0x00080000
 WS_EX_NOACTIVATE   = 0x08000000
 WS_EX_TOOLWINDOW   = 0x00000080
 WS_EX_APPWINDOW    = 0x00040000
+HWND_BOTTOM        = 1
 HWND_TOPMOST       = -1
+HWND_NOTOPMOST     = -2
 SWP_NOMOVE         = 0x0002
 SWP_NOSIZE         = 0x0001
 SWP_NOACTIVATE     = 0x0010
 SWP_SHOWWINDOW     = 0x0040
 SWP_FRAMECHANGED   = 0x0020
+
+# ShowWindow flags
+SW_SHOW          = 5
+SW_SHOWNA        = 8   # mostra senza attivare (No Activate)
+SW_PARENTCLOSING = 1   # lParam di WM_SHOWWINDOW quando Win+D nasconde
+
+# Low-level keyboard hook
+WH_KEYBOARD_LL = 13
+WM_KEYDOWN     = 0x0100
+WM_SYSKEYDOWN  = 0x0104
+WM_KEYUP       = 0x0101
+WM_SYSKEYUP    = 0x0105
+VK_LWIN        = 0x5B
+VK_RWIN        = 0x5C
+VK_D           = 0x44
+
+# Firma esplicita 64-bit per CallNextHookEx (evita OverflowError)
+user32.CallNextHookEx.restype  = ctypes.c_ssize_t
+user32.CallNextHookEx.argtypes = [
+    ctypes.c_ssize_t, ctypes.c_int,
+    ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM]
+user32.SetWindowsHookExW.restype  = ctypes.c_ssize_t
+user32.SetWindowsHookExW.argtypes = [
+    ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.wintypes.DWORD]
+user32.UnhookWindowsHookEx.restype  = ctypes.c_bool
+user32.UnhookWindowsHookEx.argtypes = [ctypes.c_ssize_t]
 
 # Screenshot exclusion (Win10 2004+)
 WDA_EXCLUDEFROMCAPTURE = 0x00000011
@@ -134,6 +161,120 @@ def _apply_rounded_region(win: tk.BaseWidget, radius: int = 12):
         user32.SetWindowRgn(hwnd, rgn, True)
     except Exception:
         pass
+
+
+
+class KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("vkCode",      ctypes.c_uint),
+        ("scanCode",    ctypes.c_uint),
+        ("flags",       ctypes.c_uint),
+        ("time",        ctypes.c_uint),
+        ("dwExtraInfo", ctypes.c_ulong),
+    ]
+
+_KbHookProc = ctypes.WINFUNCTYPE(
+    ctypes.c_ssize_t,
+    ctypes.c_int,
+    ctypes.wintypes.WPARAM,
+    ctypes.wintypes.LPARAM)
+
+
+def _start_win_d_hook(on_win_d) -> threading.Thread:
+    """
+    Avvia un thread dedicato con message loop che installa WH_KEYBOARD_LL
+    e chiama on_win_d() ogni volta che viene premuto Win+D.
+    Restituisce il thread. Per fermare l'hook, chiama stop() sul valore
+    restituito (è un oggetto con metodo stop che invia WM_QUIT al thread).
+    """
+    import ctypes.wintypes as wt
+
+    class _HookThread(threading.Thread):
+        def __init__(self):
+            super().__init__(daemon=True)
+            self._hook    = ctypes.c_ssize_t(0)
+            self._tid     = 0
+            self._ready   = threading.Event()
+
+        def run(self):
+            self._tid = ctypes.windll.kernel32.GetCurrentThreadId()
+            _win_pressed = False
+
+            def _proc(nCode, wParam, lParam):
+                nonlocal _win_pressed
+                if nCode >= 0:
+                    kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                    vk = kb.vkCode
+                    if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                        if vk in (VK_LWIN, VK_RWIN):
+                            _win_pressed = True
+                        elif vk == VK_D and _win_pressed:
+                            on_win_d()
+                    elif wParam in (WM_KEYUP, WM_SYSKEYUP):
+                        if vk in (VK_LWIN, VK_RWIN):
+                            _win_pressed = False
+                return user32.CallNextHookEx(self._hook, nCode, wParam, lParam)
+
+            self._proc_ref = _KbHookProc(_proc)   # mantieni vivo
+            self._hook = user32.SetWindowsHookExW(
+                WH_KEYBOARD_LL, self._proc_ref, None, 0)
+            self._ready.set()
+
+            msg = wt.MSG()
+            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+
+            user32.UnhookWindowsHookEx(self._hook)
+
+        def stop(self):
+            if self._tid:
+                ctypes.windll.user32.PostThreadMessageW(
+                    self._tid, 0x0012, 0, 0)  # WM_QUIT
+
+    t = _HookThread()
+    t.start()
+    t._ready.wait(timeout=1.0)
+    return t
+
+
+def _find_worker_window() -> int:
+    """
+    Trova il WorkerW che Windows usa come sfondo del desktop (dietro le icone).
+    È la finestra a cui ancorare i widget desktop stile Rainmeter, così
+    Win+D non li nasconde.
+    Restituisce 0 se non trovato (fallback al normale HWND_BOTTOM).
+
+    Tecnica: invia WM_SPAWN_WORKER a Progman → Windows crea WorkerW →
+    enumeriamo i figli di Progman cercando quello con SHELLDLL_DefView,
+    poi prendiamo il suo fratello WorkerW.
+    """
+    WM_SPAWN_WORKER = 0x052C
+    progman = user32.FindWindowW("Progman", None)
+    if not progman:
+        return 0
+
+    # Stimola Windows a creare il WorkerW se non esiste ancora
+    result = ctypes.c_ulong(0)
+    user32.SendMessageTimeoutW(progman, WM_SPAWN_WORKER, 0, 0, 0, 100,
+                               ctypes.byref(result))
+
+    worker_hwnd = ctypes.c_size_t(0)
+
+    EnumWindowsProc = ctypes.WINFUNCTYPE(
+        ctypes.c_bool, ctypes.c_size_t, ctypes.c_size_t)
+
+    @EnumWindowsProc
+    def _cb(hwnd, _):
+        shell = user32.FindWindowExW(hwnd, None, "SHELLDLL_DefView", None)
+        if shell:
+            sibling = user32.FindWindowExW(None, hwnd, "WorkerW", None)
+            if sibling:
+                worker_hwnd.value = sibling
+        return True
+
+    user32.EnumWindows(_cb, 0)
+    return worker_hwnd.value
 
 
 def _setup_glass_window(win: tk.Toplevel, W: int, H: int, x: int, y: int,
@@ -567,11 +708,12 @@ class ClickSlider(tk.Canvas):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Contenuto pannello condiviso (ControlPanel)
+# Contenuto pannello condiviso (ControlPanel e DeskWidget)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _build_panel_content(frame: tk.Frame, overlay: "DimmerOverlay",
-                          dpi: float, on_settings, on_pause, on_quit) -> dict:
+                          dpi: float, is_widget: bool,
+                          on_pin, on_settings, on_pause, on_quit) -> dict:
     font_sz     = max(9,  int(9  * dpi))
     font_szb    = max(11, int(11 * dpi))
     font_xs     = max(7,  int(7  * dpi))
@@ -596,6 +738,17 @@ def _build_panel_content(frame: tk.Frame, overlay: "DimmerOverlay",
         cursor="hand2", bd=0, command=on_settings)
     refs["settings_btn"].pack(side="right", padx=(3, 0))
     Tooltip(refs["settings_btn"], "Impostazioni")
+
+    pin_icon = "🔓" if is_widget else "📌"
+    pin_tip  = "Sblocca dal desktop" if is_widget else "Fissa sul desktop"
+    refs["pin_btn"] = tk.Button(
+        title_row, text=pin_icon,
+        bg=BG_COLOR, fg=FG_DIM, relief="flat",
+        activebackground=BTN_ACT, activeforeground=FG_COLOR,
+        font=("Segoe UI", btn_icon_sz), padx=5, pady=2,
+        cursor="hand2", bd=0, command=on_pin)
+    refs["pin_btn"].pack(side="right", padx=(3, 0))
+    Tooltip(refs["pin_btn"], pin_tip)
 
     # ── Slider oscuramento ────────────────────────────────────────────────────
     row1 = tk.Frame(frame, bg=BG_COLOR)
@@ -1168,7 +1321,8 @@ class ControlPanel:
         frame.pack(fill="both", expand=True)
 
         self._refs = _build_panel_content(
-            frame, self.overlay, dpi,
+            frame, self.overlay, dpi, is_widget=False,
+            on_pin=self._become_widget,
             on_settings=self._toggle_settings,
             on_pause=self._on_pause,
             on_quit=self._on_quit)
@@ -1202,6 +1356,11 @@ class ControlPanel:
         self.panel_root.destroy()
         sys.exit(0)
 
+    def _become_widget(self):
+        self._win.destroy()
+        ControlPanel._instance = None
+        DeskWidget(self.overlay, self.panel_root)
+
     def _toggle_settings(self):
         if SettingsPanel._instance is not None:
             SettingsPanel._instance._close()
@@ -1226,6 +1385,346 @@ class ControlPanel:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# DeskWidget (widget fisso sul desktop, con modalità popup temporanea)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class DeskWidget:
+    _instance = None
+
+    def __init__(self, overlay: "DimmerOverlay", panel_root: tk.Tk):
+        if DeskWidget._instance is not None:
+            # Se esiste già, lo porta in modalità popup (visibile sopra tutto)
+            try:
+                DeskWidget._instance.show_as_popup()
+            except Exception:
+                pass
+            return
+        DeskWidget._instance = self
+        self.overlay         = overlay
+        self.panel_root      = panel_root
+        self._anchored_to_worker = False
+        self._floating           = False
+        self._win_d_hook         = None   # hotkey Win+D per ripristino widget
+        self._build()
+
+    # ── Costruzione ───────────────────────────────────────────────────────────
+    def _build(self):
+        dpi   = _DPI
+        win   = tk.Toplevel(self.panel_root)
+        self._win = win
+        pad_x = max(16, int(16 * dpi))
+        pad_y = max(14, int(14 * dpi))
+        W     = max(320, int(320 * dpi))
+        H     = max(260, int(260 * dpi))
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        _setup_glass_window(win, W, H, sw - W - 16, sh - H - 56, alpha=0.85)
+
+        outer = tk.Frame(win, bg=SEP_COLOR, padx=1, pady=1)
+        outer.pack(fill="both", expand=True)
+        self._frame = tk.Frame(outer, bg=BG_COLOR, padx=pad_x, pady=pad_y)
+        self._frame.pack(fill="both", expand=True)
+
+        self._refs = _build_panel_content(
+            self._frame, self.overlay, dpi, is_widget=True,
+            on_pin=self._on_pin,
+            on_settings=self._toggle_settings,
+            on_pause=self._on_pause,
+            on_quit=self._on_quit)
+        _wire_sliders(self._refs, self.overlay)
+
+        win.update_idletasks()
+        self._set_desktop_layer()
+        self._install_win_d_hook()
+        self._monitor_loop()
+
+    # ── Hook Win+D (WH_KEYBOARD_LL) ───────────────────────────────────────────
+    def _install_win_d_hook(self):
+        if self._win_d_hook is not None:
+            return
+
+        def _on_win_d():
+            if self._floating:
+                return
+            # Win+D nasconde la finestra dopo l'input — aspettiamo 200ms
+            # poi ripristiniamo. Il delay copre il tempo che Windows impiega
+            # a processare Win+D e nascondere le finestre.
+            try:
+                self._win.after(200, self._restore_desktop)
+            except Exception:
+                pass
+
+        self._win_d_hook = _start_win_d_hook(_on_win_d)
+
+    def _remove_win_d_hook(self):
+        if self._win_d_hook is not None:
+            try:
+                self._win_d_hook.stop()
+            except Exception:
+                pass
+            self._win_d_hook = None
+
+    # ── Layer desktop (modalità pinned) ───────────────────────────────────────
+    def _set_desktop_layer(self):
+        """
+        Posiziona il widget sul layer desktop e installa il WndProc hook
+        per intercettare WM_SHOWWINDOW (usato da Win+D per nascondere le finestre).
+
+        Strategie in ordine:
+        1. WndProc hook — intercetta WM_SHOWWINDOW e annulla il nascondiglio
+        2. SetParent su WorkerW — se trovato, la finestra è figlia del desktop
+        3. HWND_BOTTOM fallback — il monitor_loop rileva e ripristina
+        """
+        try:
+            hwnd = _hwnd(self._win)
+
+            # Stili extended: no-activate, tool (no taskbar), layered
+            ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            user32.SetWindowLongW(
+                hwnd, GWL_EXSTYLE,
+                (ex | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED)
+                & ~WS_EX_APPWINDOW)
+
+            # Tenta ancoraggio al WorkerW (solo se non già ancorato)
+            worker = _find_worker_window()
+            if worker and not self._anchored_to_worker:
+                result = user32.SetParent(hwnd, worker)
+                if result:
+                    self._anchored_to_worker = True
+                    sw = self._win.winfo_screenwidth()
+                    sh = self._win.winfo_screenheight()
+                    W  = self._win.winfo_width()
+                    H  = self._win.winfo_height()
+                    user32.SetWindowPos(hwnd, HWND_BOTTOM,
+                                        sw - W - 16, sh - H - 56, 0, 0,
+                                        SWP_NOSIZE | SWP_NOACTIVATE |
+                                        SWP_SHOWWINDOW)
+                    return
+
+            # Fallback: porta in fondo allo z-order
+            user32.SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0,
+                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+        except Exception as e:
+            print(f"[Desktop] Errore in _set_desktop_layer: {e}")
+
+    def _detach_from_worker(self):
+        """Stacca dal WorkerW e rimuove l'hook Win+D (modalità floating)."""
+        if self._anchored_to_worker:
+            try:
+                hwnd = _hwnd(self._win)
+                user32.SetParent(hwnd, None)
+            except Exception:
+                pass
+            self._anchored_to_worker = False
+        self._remove_win_d_hook()
+
+    # ── Monitor loop (mantiene il widget sul desktop) ─────────────────────────
+    def _monitor_loop(self):
+        """
+        Mantiene il widget in fondo allo z-order ogni 200ms.
+        Il rilevamento Win+D è gestito da _install_keyboard_hook() tramite
+        la libreria keyboard, che intercetta Win+D prima che Windows nasconda
+        la finestra.
+        """
+        try:
+            if not self._win.winfo_exists():
+                return
+            if self._floating:
+                self._win.after(200, self._monitor_loop)
+                return
+
+            hwnd = _hwnd(self._win)
+            tk_state = self._win.state()
+            if tk_state != "normal":
+                # Recupera dallo stato withdrawn (es. dopo Win+D con WorkerW)
+                self._win.deiconify()
+                self._win.update_idletasks()
+                user32.ShowWindow(hwnd, SW_SHOWNA)
+
+            user32.SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0,
+                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+        except Exception:
+            pass
+        self._win.after(200, self._monitor_loop)
+
+    def _restore_desktop(self):
+        try:
+            if not self._win.winfo_exists():
+                return
+            hwnd = _hwnd(self._win)
+            self._win.deiconify()
+            self._win.update_idletasks()
+            user32.ShowWindow(hwnd, SW_SHOWNA)
+            user32.SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0,
+                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+        except Exception:
+            pass
+
+    # ── Modalità popup (floating) ─────────────────────────────────────────────
+    def show_as_popup(self):
+        """
+        Chiamato dal tray o dal pin button: porta il widget in modalità popup.
+        Se è già floating lo porta semplicemente in focus.
+        """
+        if self._floating:
+            # Già in modalità popup: porta semplicemente in focus
+            try:
+                self._win.lift()
+                self._win.focus_force()
+            except Exception:
+                pass
+            return
+
+        self._floating = True
+        self._detach_from_worker()
+
+        try:
+            hwnd = _hwnd(self._win)
+
+            # Rimuovi WS_EX_NOACTIVATE e WS_EX_TOOLWINDOW
+            ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            user32.SetWindowLongW(
+                hwnd, GWL_EXSTYLE,
+                (ex & ~(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_APPWINDOW))
+                | WS_EX_LAYERED)
+
+            self._win.deiconify()
+            self._win.update_idletasks()
+            user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+            self._win.lift()
+            self._win.focus_force()
+
+            self._update_pin_button(is_widget=False)
+
+            # Binda FocusOut con delay: evita che scatti subito
+            # prima che la finestra abbia effettivamente ricevuto il focus
+            self._win.after(400, self._bind_focus_out)
+
+        except Exception:
+            pass
+
+    def _bind_focus_out(self):
+        """Binda FocusOut solo dopo che la finestra ha avuto il tempo di ricevere focus."""
+        if self._floating and self._win.winfo_exists():
+            self._win.bind("<FocusOut>", self._on_popup_focus_out)
+
+    def _return_to_desktop(self):
+        if not self._floating:
+            return
+
+        self._floating = False
+
+        try:
+            self._win.unbind("<FocusOut>")
+        except Exception:
+            pass
+
+        try:
+            hwnd = _hwnd(self._win)
+            user32.SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+        except Exception:
+            pass
+
+        # Assicurati che la finestra sia visibile prima di riancorare
+        try:
+            if self._win.state() != "normal":
+                self._win.deiconify()
+                self._win.update_idletasks()
+        except Exception:
+            pass
+
+        self._update_pin_button(is_widget=True)
+        self._set_desktop_layer()
+        self._install_win_d_hook()
+
+    def _on_popup_focus_out(self, event):
+        """
+        Quando il popup perde il focus, torna automaticamente in modalità
+        widget (a meno che non ci siano Settings aperte).
+        """
+        if SettingsPanel._instance is not None:
+            return
+        # Piccolo delay per evitare falsi positivi (es. click su Settings)
+        self._win.after(200, self._check_popup_focus)
+
+    def _check_popup_focus(self):
+        """Verifica che il focus non sia tornato sulla finestra prima di rientrare."""
+        if SettingsPanel._instance is not None:
+            return
+        try:
+            focused = self._win.focus_get()
+            if focused is None:
+                self._return_to_desktop()
+        except Exception:
+            self._return_to_desktop()
+
+    def _update_pin_button(self, is_widget: bool):
+        """Aggiorna icona e tooltip del pulsante pin in base alla modalità."""
+        try:
+            btn = self._refs.get("pin_btn")
+            if btn is None:
+                return
+            # Distruggi tooltip precedente se esiste
+            if hasattr(self, '_pin_tooltip_obj') and self._pin_tooltip_obj is not None:
+                try:
+                    self._pin_tooltip_obj._hide()
+                    btn.unbind("<Enter>")
+                    btn.unbind("<Leave>")
+                except Exception:
+                    pass
+            if is_widget:
+                btn.config(text="🔓")
+                self._pin_tooltip_obj = Tooltip(btn, "Sblocca dal desktop")
+            else:
+                btn.config(text="📌")
+                self._pin_tooltip_obj = Tooltip(btn, "Fissa sul desktop")
+        except Exception:
+            pass
+
+    # ── Pulsante pin ──────────────────────────────────────────────────────────
+    def _on_pin(self):
+        """
+        Toggle pin/unpin:
+        - Se in modalità widget (pinned) → entra in modalità popup (floating)
+        - Se in modalità popup (floating) → torna sul desktop (pinned)
+        """
+        if self._floating:
+            self._return_to_desktop()
+        else:
+            self.show_as_popup()
+
+    # ── Altri handler ─────────────────────────────────────────────────────────
+    def _on_pause(self):
+        self.overlay.toggle_pause()
+        self._refs["pause_btn"].config(
+            text="▶  Riprendi" if self.overlay.paused else "⏸  Pausa")
+
+    def _on_quit(self):
+        self._remove_win_d_hook()
+        self._detach_from_worker()
+        self.overlay.save_state()
+        self.overlay.hide()
+        self._win.destroy()
+        DeskWidget._instance = None
+        global _tray_icon
+        if _tray_icon:
+            _tray_icon.stop()
+
+    def _become_popup(self):
+        """Pin button da ControlPanel: converte il popup in DeskWidget permanente."""
+        # Non usato direttamente — il pin ora fa toggle su DeskWidget stesso.
+        # Mantenuto per compatibilità con _build_panel_content.
+        self._on_pin()
+
+    def _toggle_settings(self):
+        if SettingsPanel._instance is not None:
+            SettingsPanel._instance._close()
+        else:
+            SettingsPanel(self.overlay, self.panel_root, self._win)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # System tray
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1244,7 +1743,10 @@ def build_tray(overlay: "DimmerOverlay", panel_root: tk.Tk):
     global _tray_icon
 
     def open_panel(icon, item):
-        panel_root.after(0, lambda: ControlPanel(overlay, panel_root))
+        if DeskWidget._instance is not None:
+            panel_root.after(0, DeskWidget._instance.show_as_popup)
+        else:
+            panel_root.after(0, lambda: ControlPanel(overlay, panel_root))
 
     def on_quit(icon, item):
         overlay.save_state()
