@@ -1,0 +1,5 @@
+pystray
+pillow
+astral
+keyboard
+tomli ; python_version < "3.11"
